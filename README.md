@@ -1,2 +1,143 @@
-# MIET_calc
-Python package for simulating advanced fluorescence microscopy. Models Metal-Induced Energy Transfer (MIET) to compute lifetime and brightness near layered metal/dielectric films, and implements scalar/vectorial PSF simulations for confocal optics (Richards–Wolf).
+# MIET and Confocal Microscopy Simulation Package
+
+## Overview
+
+This Python package provides a collection of tools for simulating phenomena related to fluorescence microscopy, specifically focusing on Metal-Induced Energy Transfer (MIET) and the optics of confocal microscopy. It is a Python port of a MATLAB-based simulation tool, designed for researchers and students in optics and biophysics.
+
+The code can calculate fluorescence lifetime and brightness of dipoles near layered metallic or dielectric structures and simulate Point Spread Functions (PSFs) using vectorial and scalar models.
+
+## Features
+
+*   **Metal-Induced Energy Transfer (MIET):**
+    *   Calculate fluorescence lifetime (`miet_calc`) and brightness (`brightness_dipole`) for emitters near multi-layered substrates.
+    *   Supports metallic layers by loading complex refractive index data from a `.mat` file.
+    *   Calculates the angular distribution of radiation for dipoles in stratified media.
+
+*   **Confocal Microscopy Optics:**
+    *   Vectorial PSF simulation based on the Richards-Wolf model (`gauss_exc` in `Optics_main.py`).
+    *   Scalar PSF simulation, including coverslip aberration and finite pinhole effects (`Scalar_Confocal.py`).
+    *   Generation of defocused patterns and single-emitter PSFs (`PatternGeneration`).
+
+## Core Modules
+
+*   `MIET_main.py`: Contains the core physics functions for MIET calculations, including Fresnel coefficients, dipole radiation models, and lifetime/brightness calculations.
+*   `Optics_main.py`: Implements the vectorial model for focused Gaussian beams and PSF generation in confocal microscopy.
+*   `Scalar_Confocal.py`: Provides a scalar model for calculating excitation and detection PSFs, including aberrations.
+*   `utilities.py`: A collection of helper functions for plotting and data visualization, including 2D and 3D rendering of simulation results.
+*   `MIET_examples.py`: A script containing various examples demonstrating how to use the functions in this package.
+
+## Key Functions
+
+This section provides a brief overview of the most important functions in the core modules.
+
+### `MIET_main.py`
+
+*   [`fresnel(w1, n1, n2)`](MIET_main.py:20): Calculates the Fresnel reflection and transmission coefficients (rp, rs, tp, ts) for p- and s-polarized light. It can handle both a single interface between two media and a multi-layered stack.
+
+*   [`dipoleL(theta, z, n0, n, n1, d0, d, d1)`](MIET_main.py:189): Computes the electromagnetic field components radiated by a dipole embedded in a stratified medium. This is a core function for determining how the environment modifies the dipole's emission.
+
+*   [`lifetimeL(...)`](MIET_main.py:479): Calculates the normalized decay rates for a dipole emitter. It computes the contributions from propagating waves (far-field radiation), evanescent waves (near-field quenching), and guided modes. This is the fundamental calculation underlying the MIET effect.
+
+*   [`miet_calc(...)`](MIET_main.py:1349): A high-level function to compute the fluorescence lifetime calibration curve (lifetime vs. distance `z`). It integrates the results from `lifetimeL` over the emission spectrum of a dye and considers the quantum yield and free-space lifetime.
+
+*   [`brightness_dipole(...)`](MIET_main.py:1517): Calculates the apparent brightness of a dipole by considering both the collection efficiency (how much light is collected by the objective) and the local quantum yield. It provides results for different dipole orientations (vertical, parallel, rotating, and fixed-random).
+
+*   [`MetalsDB(mat_path)`](MIET_main.py:798): A helper class to load and interpolate wavelength-dependent complex refractive indices for various metals from a `.mat` file.
+
+### `Optics_main.py`
+
+*   [`gauss_exc(...)`](Optics_main.py:35): Implements the Richards-Wolf vectorial focusing model to calculate the electromagnetic field of a tightly focused Gaussian beam in a stratified medium. It returns the field components as a series of cylindrical harmonics, which can be used to reconstruct the 3D Point Spread Function (PSF).
+
+*   [`PulsedExcitation(...)`](Optics_main.py:388): Models the effects of fluorescence saturation under pulsed laser excitation. It calculates the effective excitation probability, which can be used to correct for saturation artifacts in fluorescence correlation spectroscopy (FCS) or lifetime measurements.
+
+*   [`SEPDipole(...)`](Optics_main.py:1004): Calculates the image of a single point-like dipole emitter (Single Emitter PSF) as it would appear on a camera. It takes into account the layered structure, objective NA, and dipole orientation. The output is a set of radial harmonics that can be used to reconstruct the 2D image.
+
+*   [`PatternGeneration(...)`](Optics_main.py:1500): Generates a basis set of theoretical PSF patterns for a range of different dipole orientations. This is useful for single-molecule orientation imaging techniques, where the shape of a molecule's PSF is used to determine its 3D orientation. The function can also generate **defocused patterns** by adjusting the `focus` parameter. The function signature is as follows:
+    ```python
+    model = PatternGeneration(
+        z, NA, n0, n, n1, d0, d, d1,
+        lamem, mag, focus,
+        atf, ring,
+        pixel, nn,
+        be_res, al_res,
+        pic
+    )
+    ```
+
+*   [`mdf_confocal_microscopy_py(...)`](Optics_main.py:2176): A high-level function that demonstrates how to combine the excitation fields from `gauss_exc` and the detection fields to generate a Molecular Detection Function (MDF) for a confocal microscope.
+
+## Getting Started
+
+To get started with this package, follow these steps:
+
+1.  **Clone the repository:**
+    ```bash
+    git clone <your-repository-url>
+    cd <your-repository-directory>
+    ```
+
+2.  **Install the dependencies:**
+    It is recommended to use a virtual environment.
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+    pip install -r requirements.txt
+    ```
+
+3.  **Run the examples:**
+    Explore the `MIET_examples.py` script to see how the different functions are used. You can run the script directly to generate plots and see the simulations in action.
+    ```bash
+    python MIET_examples.py
+    ```
+
+## Dependencies
+
+This package requires Python 3 and the following libraries:
+
+*   **numpy**: For numerical operations.
+*   **scipy**: For scientific computing, including special functions and interpolation.
+*   **matplotlib**: For 2D plotting.
+*   **scikit-image**: For 3D visualization of isosurfaces (`marching_cubes`).
+*   **plotly**: For interactive 3D visualizations.
+
+You can install these packages using pip:
+```bash
+pip install numpy scipy matplotlib scikit-image plotly
+```
+**Note on `.mat` files:** The `scipy.io.loadmat` function is used to load the `metals.mat` file. If this file was saved in a MATLAB version greater than 7.3, you might need an additional library like `h5py` or `mat73` to read it.
+
+## Data
+
+*   `metals.mat`: A MATLAB data file containing wavelength-dependent complex refractive indices for various metals. This file is required for any MIET calculations involving metallic layers. It is loaded by the `MetalsDB` class in `MIET_main.py`.
+
+## Usage Example
+
+Here is a simple example from `MIET_examples.py` to calculate and plot a MIET lifetime curve.
+
+```python
+import numpy as np
+from MIET_main import MetalsDB, miet_calc
+
+# Load the metals database
+db = MetalsDB('metals.mat')
+
+# Define the layer stack
+# Here: glass | gold (10nm) | spacer (5nm) | dipole layer (water) | top (water)
+n0 = [1.52, 20, 1.46]   # 20 is the ID for 'gold' in the .mat file
+d0 = [10, 5]            # thicknesses in nm
+n  = 1.33               # dipole layer index
+n1 = [1.33]             # top half-space
+d1 = []
+
+# Calculate and plot the lifetime curve
+z, life = miet_calc(
+    al_res=np.nan,          # Use np.nan for orientation averaging
+    lamem=690.0,            # Emission wavelength in nm
+    n0=n0, n=n, n1=n1, d0=d0, d=200.0, d1=d1,
+    qyield=0.8, tau_free=3.5,
+    fig=True,               # Set to True to generate a plot
+    metals_db=db            # Pass the database object
+)
+## License
+
+Please add license information here. For open-source projects, it's common to use a license like MIT, Apache 2.0, or GPLv3.
