@@ -68,43 +68,56 @@ This section provides a brief overview of the most important functions in the co
 
 ## Getting Started
 
-To get started with this package, follow these steps:
+### Installation
+
+To install the package and set up the environment, please follow these steps. It is recommended to use Conda for environment management.
 
 1.  **Clone the repository:**
     ```bash
-    git clone <your-repository-url>
-    cd <your-repository-directory>
+    git clone https://github.com/your-username/MIET-confocal-simulation.git
+    cd MIET-confocal-simulation
     ```
 
-2.  **Install the dependencies:**
-    It is recommended to use a virtual environment.
+2.  **Create the Conda environment from the `MIET_calc_env.yml` file:**
+    This file contains all the necessary dependencies for the project. Run the following command in your terminal:
     ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
-    pip install -r requirements.txt
+    conda env create -f MIET_calc_env.yml
+    ```
+    This will create a new Conda environment named `MIET_calc_env`.
+
+3.  **Activate the Conda environment:**
+    Before running the scripts, you need to activate the newly created environment:
+    ```bash
+    conda activate MIET_calc_env
+    ```
+    You should see `(MIET_calc_env)` at the beginning of your terminal prompt.
+
+### Running the Examples
+
+Once the environment is set up and activated, you can run the example scripts to see the package in action. The recommended IDE for this project is Spyder, which is included in the Conda environment.
+
+1.  **Launch Spyder:**
+    ```bash
+    spyder
     ```
 
-3.  **Run the examples:**
-    Explore the `MIET_examples.py` script to see how the different functions are used. You can run the script directly to generate plots and see the simulations in action.
-    ```bash
-    python MIET_examples.py
-    ```
+2.  **Run the `MIET_examples.py` script:**
+    Inside Spyder, open the `MIET_examples.py` file and run it. This will execute various simulations and generate plots, demonstrating the core functionalities of the package.
 
 ## Dependencies
 
-This package requires Python 3 and the following libraries:
+All the required dependencies for this project are listed in the `MIET_calc_env.yml` file. This includes Python 3 and libraries such as:
 
 *   **numpy**: For numerical operations.
 *   **scipy**: For scientific computing, including special functions and interpolation.
 *   **matplotlib**: For 2D plotting.
 *   **scikit-image**: For 3D visualization of isosurfaces (`marching_cubes`).
 *   **plotly**: For interactive 3D visualizations.
+*   **spyder**: The recommended IDE for running the code.
 
-You can install these packages using pip:
-```bash
-pip install numpy scipy matplotlib scikit-image plotly
-```
-**Note on `.mat` files:** The `scipy.io.loadmat` function is used to load the `metals.mat` file. If this file was saved in a MATLAB version greater than 7.3, you might need an additional library like `h5py` or `mat73` to read it.
+The environment can be set up using the command provided in the "Getting Started" section.
+
+**Note on `.mat` files:** The `scipy.io.loadmat` function is used to load the `metals.mat` file. The environment file includes the necessary libraries to handle this.
 
 ## Data
 
