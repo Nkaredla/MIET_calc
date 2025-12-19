@@ -2,7 +2,9 @@
 
 ## Overview
 
-This Python package provides a collection of tools for simulating phenomena related to fluorescence microscopy, specifically focusing on Metal-Induced Energy Transfer (MIET) and the optics of confocal microscopy. It is a Python port of a MATLAB-based calculations, designed for researchers and students in optics and biophysics. A majority of the functions were written in Matlab originally by Joerg Enderlein, University of Goettingen (https://www.joerg-enderlein.de/).
+This Python package provides a collection of tools for simulating phenomena related to fluorescence microscopy, specifically focusing on Metal-Induced Energy Transfer (MIET) and the optics of confocal microscopy. It is a Python port of a MATLAB-based calculations, designed for researchers and students in optics and biophysics. A majority of the functions were written in Matlab originally by Joerg Enderlein and group, University of Goettingen (https://www.joerg-enderlein.de/).
+
+There are numerous articles that describe the math behind the scripts in this repository. Some of these are described in the review aricle: https://journals.aps.org/rmp/abstract/10.1103/RevModPhys.96.025003
 
 The code can calculate fluorescence lifetime and brightness of dipoles near layered metallic or dielectric structures and simulate Point Spread Functions (PSFs) using vectorial and scalar models.
 
