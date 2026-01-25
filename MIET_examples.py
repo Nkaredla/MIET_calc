@@ -716,7 +716,7 @@ CMAP_CONT = mpl.colors.LinearSegmentedColormap.from_list(
 
 
 # -----------------------------
-# Physics helpers
+# Main calculations
 # -----------------------------
 def brightness_miet_vs_z(z_vec_um, n0, n_dip, n1, d0_um, d_um, d1_um, lam_em_um, NA, QY):
     """Wrap brightness_dipole (expects k0=1 units). Return bp, bv, bf vs z."""
