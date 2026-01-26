@@ -29,9 +29,9 @@ import warnings
 # Import required modules
 from PTU_ScanRead import PTU_ScanRead, Process_Frame
 from FLIM_fitter import Calc_mIRF, FluoFit, PatternMatchIm, PIRLSnonneg_batch_gpu
-from FlavMetaFLIM import (
-    load_or_process_ptu_data, 
-    analyze_flim_data, 
+from utilities import (
+    load_or_process_ptu_data,
+    analyze_flim_data,
     vignette_correction,
     display_amplitude_maps_subplot
 )

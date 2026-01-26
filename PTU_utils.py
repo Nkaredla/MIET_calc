@@ -6,6 +6,42 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from matplotlib.colors import Normalize
+from math import isfinite
+
+# Additional imports for MIET calculations
+try:
+    import scipy.io
+    from scipy.interpolate import CubicSpline
+except ImportError:
+    scipy = None
+    CubicSpline = None
+
+try:
+    import h5py
+except ImportError:
+    h5py = None
+
+# MIET calibration helpers (from MIET_main.py in the same folder)
+try:
+    from MIET_main import (
+        MetalsDB, brightness_dipole, miet_calc, fresnel, dipoleL,
+        lifetimeL, hash_waveguide_mode
+    )
+except ImportError as exc:  # pragma: no cover - import must succeed in runtime env
+    raise ImportError(
+        "MIET_main.py must be importable from the same folder for MIET calibration."
+    ) from exc
+
+
+def _load_metals_db(metals_path: Optional[Union[str, Path]] = None) -> MetalsDB:
+    """Load metals.mat via the MIET_main MetalsDB helper."""
+    path = Path(metals_path) if metals_path is not None else Path(__file__).with_name("metals.mat")
+    if not path.exists():
+        raise FileNotFoundError(f"Metals database not found at {path}")
+    return MetalsDB(str(path))
 
 
 # =============================================================================
@@ -607,5 +643,497 @@ def tttr2xfcs(y: np.ndarray, num: np.ndarray, Ncasc: int, Nsub: int) -> Tuple[np
 
     good = autotime != 0
     return auto[good, :, :], autotime[good]
+
+
+# =============================================================================
+# MATLAB helper translations and MIET+PTU pipeline
+# =============================================================================
+def interp1_nan(x: np.ndarray, y: np.ndarray, xq: np.ndarray) -> np.ndarray:
+    """MATLAB interp1(...,'linear',NaN) equivalent."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    xq = np.asarray(xq, dtype=float)
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    return np.interp(xq, x, y, left=np.nan, right=np.nan)
+
+
+def tttr2bin(sync_ticks: np.ndarray, macrobin_ticks: float) -> np.ndarray:
+    """Bin photon arrivals by macro time bins (integer ticks)."""
+    s = np.asarray(sync_ticks, dtype=np.int64)
+    if s.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    w = int(np.round(macrobin_ticks))
+    if w <= 0:
+        raise ValueError("macrobin_ticks must be >= 1 tick")
+
+    idx = (s // w).astype(np.int64)
+    counts = np.bincount(idx, minlength=idx.max() + 1)
+    return counts.astype(np.int64)
+
+
+def tttr2bintcspc(
+    sync_ticks: np.ndarray,
+    params: Tuple[float, int],
+    tcspc_shifted: np.ndarray,
+    n_micro_bins: int,
+) -> np.ndarray:
+    """Bin TCSPC microtimes inside macro bins (MATLAB tttr2bintcspc analogue)."""
+    s = np.asarray(sync_ticks, dtype=np.int64)
+    t = np.asarray(tcspc_shifted, dtype=np.int64)
+    if s.size == 0:
+        return np.zeros((n_micro_bins, 0), dtype=np.int64)
+
+    macro_w = int(np.round(params[0]))
+    micro_rebin = int(params[1])
+    if macro_w <= 0:
+        raise ValueError("macrobin width must be >=1")
+    if micro_rebin <= 0:
+        raise ValueError("micro rebin must be >=1")
+
+    valid = t > 0
+    if not np.any(valid):
+        n_macro = int((s.max() // macro_w) + 1)
+        return np.zeros((n_micro_bins, n_macro), dtype=np.int64)
+
+    s = s[valid]
+    t = t[valid]
+
+    macro_idx = (s // macro_w).astype(np.int64)
+    micro_idx = (t // micro_rebin).astype(np.int64)
+
+    keep = (micro_idx >= 0) & (micro_idx < n_micro_bins)
+    macro_idx = macro_idx[keep]
+    micro_idx = micro_idx[keep]
+
+    n_macro = int(macro_idx.max() + 1) if macro_idx.size else int((s.max() // macro_w) + 1)
+    out = np.zeros((n_micro_bins, n_macro), dtype=np.int64)
+    np.add.at(out, (micro_idx, macro_idx), 1)
+    return out
+
+
+def photobleach_fit_exp(normtrace: np.ndarray) -> np.ndarray:
+    """Fit A*exp(-t/tau)+C to a normalized trace and return the fitted curve."""
+    y = np.asarray(normtrace, dtype=float)
+    x = np.arange(y.size, dtype=float)
+
+    y = np.where(np.isfinite(y), y, np.nan)
+    m = np.nanmedian(y)
+    y = np.where(np.isnan(y), m, y)
+
+    c_grid = np.linspace(0.0, np.percentile(y, 30) * 0.9, 60)
+    best = None
+    best_sse = np.inf
+
+    for c in c_grid:
+        yy = y - c
+        if np.any(yy <= 0):
+            continue
+        logy = np.log(yy)
+        A = np.vstack([np.ones_like(x), x]).T
+        coef, *_ = np.linalg.lstsq(A, logy, rcond=None)
+        a, b = coef
+        yhat = np.exp(a + b * x) + c
+        sse = float(np.mean((y - yhat) ** 2))
+        if sse < best_sse:
+            best_sse = sse
+            best = (a, b, c)
+
+    if best is None:
+        return np.ones_like(y)
+
+    a, b, c = best
+    z = np.exp(a + b * x) + c
+    z /= np.mean(z[z > 0])
+    return z
+
+
+def mseb_like(x: np.ndarray, y_mean: np.ndarray, y_std: np.ndarray, label: str):
+    """Minimal shaded-error plot replacement for MATLAB mseb."""
+    x = np.asarray(x, dtype=float)
+    y_mean = np.asarray(y_mean, dtype=float)
+    y_std = np.asarray(y_std, dtype=float)
+    plt.semilogx(x, y_mean, label=label)
+    plt.fill_between(x, y_mean - y_std, y_mean + y_std, alpha=0.2)
+
+
+def _load_gold_titan_tables(metals: MetalsDB) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return wavelength, gold, titan arrays sampled on the DB grid."""
+    wl = metals.wavelength
+    gold = metals.get_index(20, wl)   # 20: gold in MetalsDB mapping
+    titan = metals.get_index(80, wl)  # 80: titan in MetalsDB mapping
+    return wl, gold, titan
+
+
+def run_miet_ptu_pipeline(
+    ptu_path: Union[str, Path],
+    *,
+    tau0: float = 2.9,
+    qy0: float = 0.6,
+    tau1: float = 2.2,
+    lamex_um: float = 0.640,
+    lamem_um: float = 0.690,
+    NA: float = 1.49,
+    glass_n: float = 1.52,
+    n1: float = 1.33,
+    n: float = 1.33,
+    top_n: float = 1.46,
+    d0_um: Tuple[float, float, float, float] = (2e-3, 10e-3, 1e-3, 10e-3),
+    d_um: float = 3e-1,
+    d1_um: Tuple[float, ...] = (),
+    curveType: int = 2,
+    al_res: int = 100,
+    tbin_s: float = 1e-4,
+    photons_per_chunk: int = int(1e6),
+    cutoff_ns: float = 10.0,
+    shift_ns: float = 0.3,
+    micro_rebin: int = 8,
+    Ncasc: int = 13,
+    Nsub: int = 6,
+    nbunches: int = 10,
+    metals_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """Full MIET + PTU workflow translated from MATLAB."""
+
+    ptu_path = Path(ptu_path)
+    metals = _load_metals_db(metals_path)
+    wavelength, gold, titan = _load_gold_titan_tables(metals)
+
+    qy1 = qy0 * tau1 / tau0
+    qy = qy1
+    tau_free = tau1
+
+    lamem_nm = lamem_um * 1e3
+    idx = int(np.argmin(np.abs(wavelength - lamem_nm)))
+    n_ti = titan[idx]
+    n_au = gold[idx]
+
+    n0 = np.array([glass_n, n_ti, n_au, n_ti, top_n], dtype=complex)
+    d0 = np.array(d0_um, dtype=float) * 1e3
+    d1 = np.array(d1_um, dtype=float) * 1e3
+    d = float(d_um * 1e3)
+
+    z_nm, lifecurve = miet_calc(
+        al_res,
+        lamem_nm,
+        n0,
+        n,
+        n1,
+        d0,
+        d,
+        d1,
+        qy,
+        tau_free,
+        False,
+        curveType,
+        metals_db=metals,
+    )
+    z_nm = np.asarray(z_nm, dtype=float)
+    lifecurve = np.asarray(lifecurve, dtype=float)
+
+    ind = np.isfinite(lifecurve) & np.isfinite(z_nm)
+    z_nm = z_nm[ind]
+    lifecurve = lifecurve[ind]
+
+    fac = 2 * np.pi / lamem_um
+    zfac = (z_nm * 1e-3) * fac
+
+    d0fac = np.array(d0_um) * fac
+    dfac = d_um * fac
+    d1fac = (np.array(d1_um) * fac) if len(d1_um) else np.array([])
+
+    br_out = brightness_dipole(zfac, n0, n, n1, d0fac, dfac, d1fac, NA, qy, False)
+    br = np.asarray(br_out[-2], dtype=float)  # third element: rotating dipole brightness
+    br = interp1_nan(z_nm[np.isfinite(br)], br[np.isfinite(br)], z_nm)
+
+    maxz_life = int(np.nanargmax(lifecurve))
+
+    harp = harp_tcspc(ptu_path)
+    tcspc_full = harp.tcspcdata
+    pos = int(np.argmax(np.sum(tcspc_full, axis=1)))
+
+    head = harp.head
+    SyncRate = float(head.TTResult_SyncRate)
+    Resolution_s = float(head.MeasDesc_Resolution)
+    Ngate = int(np.ceil((1.0 / SyncRate) / Resolution_s))
+    bin_tcspc = np.arange(Ngate + 1, dtype=np.int64)
+
+    cnts = 0
+    flag = True
+    ttrace_list: List[np.ndarray] = []
+    tmptcspc = np.zeros(Ngate, dtype=np.int64)
+    tmptau_list: List[np.ndarray] = []
+    sync_offset = 0
+
+    macrobin_ticks = tbin_s * SyncRate
+
+    shift = int(np.round((shift_ns * 1e-9) / Resolution_s))
+    ind1 = pos + shift
+    cutoff_bins_native = int(np.ceil((cutoff_ns * 1e-9) / Resolution_s))
+    ind2 = ind1 + cutoff_bins_native
+
+    n_micro_bins = int(np.ceil((cutoff_ns * 1e-9) / Resolution_s))
+
+    while flag:
+        sync, tcspc, chan, special, num, loc, _ = PTU_Read(str(ptu_path), [cnts + 1, photons_per_chunk], head)
+
+        sync = np.asarray(sync, dtype=np.int64)
+        tcspc = np.asarray(tcspc, dtype=np.int64)
+        special = np.asarray(special, dtype=np.int64)
+
+        keep = special == 0
+        sync = sync[keep]
+        tcspc = tcspc[keep]
+
+        cnts += int(num)
+        flag = num > 0
+
+        if sync.size == 0:
+            continue
+
+        sync_cont = sync + sync_offset
+        sync_offset += int(sync[-1])
+
+        tmptcspc += mhist(tcspc, np.arange(Ngate, dtype=np.int64))
+
+        gate = (tcspc > ind1) & (tcspc <= ind2)
+        tcspc_shifted = (tcspc - ind1) * gate.astype(np.int64)
+
+        tau_block = tttr2bintcspc(
+            sync_cont,
+            (macrobin_ticks, micro_rebin),
+            tcspc_shifted,
+            n_micro_bins=n_micro_bins,
+        )
+        tmptau_list.append(tau_block)
+
+        ttrace_list.append(tttr2bin(sync_cont, macrobin_ticks))
+
+    ttrace = np.concatenate(ttrace_list, axis=0) if ttrace_list else np.zeros((0,), dtype=np.int64)
+    tmptau = np.concatenate(tmptau_list, axis=1) if tmptau_list else np.zeros((n_micro_bins, 0), dtype=np.int64)
+
+    meantrace = float(np.mean(ttrace[ttrace > 0])) if np.any(ttrace > 0) else float(np.mean(ttrace))
+    normtrace = ttrace / meantrace if meantrace != 0 else np.zeros_like(ttrace, dtype=float)
+
+    ztrace = photobleach_fit_exp(normtrace)
+    normtrace = normtrace / ztrace
+
+    delay_ns = (np.arange(tmptau.shape[0], dtype=float) * Resolution_s * 1e9 * micro_rebin)
+
+    grid_lts = np.linspace(0.1, 3.0, 200)
+    grid_bs = np.linspace(0.0, 0.2, 60)
+
+    ltmat, bmat = np.meshgrid(grid_lts, grid_bs, indexing="xy")
+    ltvec = ltmat.ravel()
+    bvec = bmat.ravel()
+
+    delay_col = delay_ns[:, None]
+    exp_part = np.exp(-delay_col / ltvec[None, :])
+    exp_part /= np.sum(exp_part, axis=0, keepdims=True)
+    pmf = (bvec[None, :] / delay_ns.size) + (1.0 - bvec[None, :]) * exp_part
+    logpmf = np.log(np.clip(pmf, 1e-300, None))
+
+    nbunch = 100
+    n_macro = tmptau.shape[1]
+    edges = np.linspace(0, n_macro, nbunch + 1).astype(int)
+
+    grid_ind = np.zeros(n_macro, dtype=int)
+    for k in range(nbunch):
+        a, b = edges[k], edges[k + 1]
+        if b <= a:
+            continue
+        scores = -(tmptau[:, a:b].T @ logpmf)
+        grid_ind[a:b] = np.argmin(scores, axis=1)
+
+    gridMLE_tau = ltvec[grid_ind]
+
+    htrace_mle = interp1_nan(lifecurve[: maxz_life + 1], z_nm[: maxz_life + 1], gridMLE_tau)
+
+    counts = tmptau.astype(float)
+    denom = np.sum(counts, axis=0)
+    denom = np.where(denom == 0, np.nan, denom)
+
+    Et = np.sum(counts * delay_ns[:, None], axis=0) / denom
+    Et2 = np.sum(counts * (delay_ns[:, None] ** 2), axis=0) / denom
+    meantau = np.sqrt(np.maximum(Et2 - Et**2, 0.0))
+
+    htrace_var = interp1_nan(lifecurve[: maxz_life + 1], z_nm[: maxz_life + 1], meantau)
+
+    pos2 = int(np.argmax(tmptcspc))
+    ind1b = pos2 + shift
+
+    t_ns = bin_tcspc[ind1b:Ngate] * Resolution_s * 1e9
+    y_tail = tmptcspc[ind1b:Ngate].astype(float)
+
+    def _fit_biexp(t, y):
+        t1_grid = np.linspace(0.2, 5.0, 60)
+        t2_grid = np.linspace(0.2, 5.0, 60)
+
+        best = None
+        best_sse = np.inf
+        for t1 in t1_grid:
+            e1 = np.exp(-t / t1)
+            for t2 in t2_grid:
+                e2 = np.exp(-t / t2)
+                A = np.vstack([e1, e2, np.ones_like(t)]).T
+                coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+                yhat = A @ coef
+                sse = float(np.mean((y - yhat) ** 2))
+                if sse < best_sse:
+                    best_sse = sse
+                    best = (t1, t2, coef)
+        t1, t2, coef = best
+        a1, a2, c = coef
+        return float(t1), float(t2), float(a1), float(a2), float(c)
+
+    t1, t2, a1, a2, c_bg = _fit_biexp(t_ns, y_tail)
+    amps = np.clip(np.array([a1, a2], dtype=float), 0.0, None)
+    taus = np.array([t1, t2], dtype=float)
+    tau_avg = float(np.sum(amps) / np.sum(amps / np.clip(taus, 1e-12, None))) if np.sum(amps) > 0 else float(np.mean(taus))
+
+    z_avg = float(interp1_nan(lifecurve[np.isfinite(lifecurve)], z_nm[np.isfinite(z_nm)], np.array([tau_avg]))[0])
+
+    iz = int(np.argmin(np.abs(z_nm - z_avg)))
+    br_fac = float(br[iz]) if np.isfinite(br[iz]) else float(np.nanmean(br))
+    norm_br = br / br_fac
+
+    maxz_br = int(np.nanargmax(norm_br))
+    htrace_int = interp1_nan(norm_br[: maxz_br + 1], z_nm[: maxz_br + 1], normtrace)
+    bhmean = meantrace * br_fac
+
+    def _finite_mask(x):
+        return np.isfinite(x)
+
+    mask1 = _finite_mask(htrace_int)
+    tpoints = np.where(mask1)[0]
+    h1 = htrace_int[mask1]
+    i1 = ttrace[mask1]
+
+    mask2 = _finite_mask(htrace_var)
+    tpoints2 = np.where(mask2)[0]
+    h2 = htrace_var[mask2]
+
+    mask3 = _finite_mask(htrace_mle)
+    tpoints3 = np.where(mask3)[0]
+    h3 = htrace_mle[mask3]
+
+    def _bunch_edges(L, nb):
+        return np.round(np.linspace(0, L, nb + 1)).astype(int)
+
+    e1 = _bunch_edges(len(tpoints), nbunches)
+    e2 = _bunch_edges(len(tpoints2), nbunches)
+    e3 = _bunch_edges(len(tpoints3), nbunches)
+
+    auto = None
+    auto2 = None
+    auto3 = None
+    autoi = None
+    autotime = None
+
+    for k in range(nbunches):
+        a, b = e1[k], e1[k + 1]
+        a2, b2 = e2[k], e2[k + 1]
+        a3, b3 = e3[k], e3[k + 1]
+
+        tmpauto, autotime = tttr2xfcs(tpoints[a:b], h1[a:b], Ncasc, Nsub)
+        tmpauto = tmpauto.squeeze()
+        if auto is None:
+            auto = np.zeros((tmpauto.size, nbunches), dtype=float)
+        auto[:, k] = tmpauto
+
+        tmpauto2, _ = tttr2xfcs(tpoints2[a2:b2], h2[a2:b2], Ncasc, Nsub)
+        tmpauto2 = tmpauto2.squeeze()
+        if auto2 is None:
+            auto2 = np.zeros((tmpauto2.size, nbunches), dtype=float)
+        auto2[:, k] = tmpauto2
+
+        tmpauto3, _ = tttr2xfcs(tpoints3[a3:b3], h3[a3:b3], Ncasc, Nsub)
+        tmpauto3 = tmpauto3.squeeze()
+        if auto3 is None:
+            auto3 = np.zeros((tmpauto3.size, nbunches), dtype=float)
+        auto3[:, k] = tmpauto3
+
+        tmpautoi, _ = tttr2xfcs(tpoints[a:b], i1[a:b], Ncasc, Nsub)
+        tmpautoi = tmpautoi.squeeze()
+        if autoi is None:
+            autoi = np.zeros((tmpautoi.size, nbunches), dtype=float)
+        autoi[:, k] = tmpautoi
+
+    autotime = autotime.squeeze().astype(float) if autotime is not None else np.zeros((0,), dtype=float)
+
+    def _norm_end(x: np.ndarray) -> np.ndarray:
+        return x / x[-1:, :] - 1.0
+
+    auto_n = _norm_end(auto)
+    auto2_n = _norm_end(auto2)
+    auto3_n = _norm_end(auto3)
+    autoi_n = _norm_end(autoi)
+
+    tau_s = autotime * tbin_s
+    x = tau_s[:-1]
+
+    plt.figure()
+    mseb_like(x, np.mean(auto3_n[:-1, :], axis=1), np.std(auto3_n[:-1, :], axis=1), label="dACF_MLE")
+    mseb_like(x, np.mean(auto2_n[:-1, :], axis=1), np.std(auto2_n[:-1, :], axis=1), label="dACF_var")
+    mseb_like(x, np.mean(auto_n[:-1, :], axis=1), np.std(auto_n[:-1, :], axis=1), label="dACF_b(h)")
+    mseb_like(
+        x,
+        np.mean(autoi_n[:-1, :], axis=1) * bhmean,
+        np.std(autoi_n[:-1, :], axis=1) * bhmean,
+        label="ACF (scaled)",
+    )
+
+    plt.xlabel("t / (s)")
+    plt.ylabel("g(t)")
+    plt.grid(True, which="both")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+
+    plt.figure()
+    plt.semilogx(tau_s, np.mean(auto3 / auto3[0:1, :], axis=1), label="dACF_MLE")
+    plt.semilogx(tau_s, np.mean(auto2 / auto2[0:1, :], axis=1), label="dACF_var")
+    plt.semilogx(tau_s, np.mean(auto / auto[0:1, :], axis=1), label="dACF_b(h)")
+    plt.semilogx(tau_s, np.mean(autoi / autoi[0:1, :], axis=1), label="ACF")
+    plt.xlabel("t / (s)")
+    plt.ylabel("g(t) / g(0)")
+    plt.grid(True, which="both")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+
+    return {
+        "z_nm": z_nm,
+        "lifecurve": lifecurve,
+        "br": br,
+        "ttrace": ttrace,
+        "normtrace": normtrace,
+        "tmptcspc": tmptcspc,
+        "tmptau": tmptau,
+        "htrace_int": htrace_int,
+        "htrace_var": htrace_var,
+        "htrace_mle": htrace_mle,
+        "auto": auto,
+        "auto2": auto2,
+        "auto3": auto3,
+        "autoi": autoi,
+        "autotime": autotime,
+        "tau_s": tau_s,
+        "z_avg_nm": z_avg,
+        "tau_avg_ns": tau_avg,
+        "bhmean": bhmean,
+        "bi_exp_bg": c_bg,
+    }
+
+
+if __name__ == "__main__":
+    example_ptu = Path(r"C:\Users\narai\OneDrive\Documents\MIET\fromTao\data for share\BOTTOM-22.ptu")
+    if example_ptu.exists():
+        _ = run_miet_ptu_pipeline(example_ptu)
+        plt.show()
+    else:
+        print("Example PTU path does not exist; edit __main__ to run the pipeline.")
 
 
