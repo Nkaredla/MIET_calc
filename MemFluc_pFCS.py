@@ -444,6 +444,99 @@ def mseb_like(x: np.ndarray, y_mean: np.ndarray, y_std: np.ndarray, label: str):
     plt.semilogx(x, y_mean, label=label)
     plt.fill_between(x, y_mean - y_std, y_mean + y_std, alpha=0.2)
 
+def normalize_corr(y: np.ndarray, mode: str = "g0") -> np.ndarray:
+    """
+    Normalize a correlation curve.
+    mode:
+      - "g0": y / y[0]   (common for ACF overlays)
+      - "end": y / y[-1] - 1  (your earlier style)
+      - "none": no normalization
+    """
+    y = np.asarray(y, dtype=float).copy()
+    if y.size == 0:
+        return y
+
+    finite = np.isfinite(y)
+    if not np.any(finite):
+        return np.full_like(y, np.nan)
+
+    if mode == "g0":
+        # use first finite value (more robust than y[0] if y[0] is NaN)
+        i0 = int(np.argmax(finite))
+        denom = y[i0]
+        if denom == 0 or not np.isfinite(denom):
+            return np.full_like(y, np.nan)
+        return y / denom
+
+    if mode == "end":
+        # use last finite value
+        i1 = int(np.where(finite)[0][-1])
+        denom = y[i1]
+        if denom == 0 or not np.isfinite(denom):
+            return np.full_like(y, np.nan)
+        return y / denom - 1.0
+
+    return y
+
+
+def plot_normalized_acf_with_fits(results: dict, *, norm_mode: str = "g0", title: str = "Normalized height ACFs + fits"):
+    """
+    Plot normalized correlation curves (int/var/MLE) and overlay normalized fit curves.
+    Expects results from enhanced_miet_ptu_pipeline (i.e., includes 'membrane_fits').
+    """
+    tau_s = np.asarray(results["tau_s"], dtype=float)
+
+    auto  = results.get("auto", None)
+    auto2 = results.get("auto2", None)
+    auto3 = results.get("auto3", None)
+
+    auto_mean  = np.mean(auto,  axis=1) if auto  is not None else None
+    auto2_mean = np.mean(auto2, axis=1) if auto2 is not None else None
+    auto3_mean = np.mean(auto3, axis=1) if auto3 is not None else None
+
+    plt.figure(figsize=(10, 6))
+
+    # --- data curves (normalized) ---
+    if auto3_mean is not None:
+        plt.semilogx(tau_s, normalize_corr(auto3_mean, norm_mode), label="Data: MLE")
+    if auto2_mean is not None:
+        plt.semilogx(tau_s, normalize_corr(auto2_mean, norm_mode), label="Data: Variance")
+    if auto_mean is not None:
+        plt.semilogx(tau_s, normalize_corr(auto_mean, norm_mode), label="Data: Intensity")
+
+    # --- overlay fits (normalized) ---
+    fits = results.get("membrane_fits", {}) or {}
+    # Map keys -> legend labels
+    fit_label = {
+        "mle_based": "Fit: MLE",
+        "variance_based": "Fit: Variance",
+        "intensity_based": "Fit: Intensity",
+    }
+
+    for key, fd in fits.items():
+        if not isinstance(fd, dict):
+            continue
+        if not fd.get("success", False):
+            continue
+        tau_fit = np.asarray(fd.get("tau_fit", []), dtype=float)
+        fit_curve = np.asarray(fd.get("fitted_curve", []), dtype=float)
+        if tau_fit.size == 0 or fit_curve.size == 0:
+            continue
+
+        plt.semilogx(
+            tau_fit,
+            normalize_corr(fit_curve, norm_mode),
+            "--",
+            linewidth=2,
+            label=f"{fit_label.get(key, 'Fit')}"
+        )
+
+    plt.xlabel("Time lag (s)")
+    plt.ylabel(f"Normalized g(t) [{norm_mode}]")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.legend(frameon=False)
+    plt.title(title)
+    plt.tight_layout()
 
 
 
@@ -1544,32 +1637,14 @@ def enhanced_miet_ptu_pipeline(
     results['membrane_fits'] = membrane_fits
     
     # Create enhanced correlation plot with fits
+    # Create normalized correlation plot with normalized fits
     if membrane_fits:
-        plt.figure(figsize=(10, 6))
-        
-        if 'mle_based' in membrane_fits:
-            fit_data = membrane_fits['mle_based']
-            plt.semilogx(fit_data['tau_fit'], fit_data['acf_fit'], 'o',
-                        label='Height ACF (MLE)', alpha=0.7)
-            plt.semilogx(fit_data['tau_fit'], fit_data['fitted_curve'], '-',
-                        label=f'Membrane model fit (R²={fit_data["r_squared"]:.3f})')
-        
-        if 'variance_based' in membrane_fits:
-            fit_data = membrane_fits['variance_based']
-            plt.semilogx(fit_data['tau_fit'], fit_data['acf_fit'], 's',
-                        label='Height ACF (Var)', alpha=0.7)
-            
-        if 'intensity_based' in membrane_fits:
-            fit_data = membrane_fits['intensity_based']
-            plt.semilogx(fit_data['tau_fit'], fit_data['acf_fit'], '^',
-                        label='Height ACF (Int)', alpha=0.7)
-        
-        plt.xlabel('Time lag (s)')
-        plt.ylabel('Height correlation')
-        plt.grid(True, which='both', alpha=0.3)
-        plt.legend()
-        plt.title('Membrane Fluctuation Model Fitting')
-        plt.tight_layout()
+          # norm_mode can be "g0" (divide by g(0)) or "end" 
+          plot_normalized_acf_with_fits(
+              results,
+              norm_mode="end",
+              title=f"Normalized height ACFs + membrane fits ({model_description})"
+          )
     
     return results
 
@@ -1592,7 +1667,7 @@ if __name__ == "__main__":
         use_minimal_model=False
     )
     
-    # Example 3: Enhanced pipeline with minimal model (like MATLAB version)
+    # Example 3: Enhanced pipeline with minimal model 
     print("\nRunning enhanced MIET-pFCS analysis with minimal membrane model...")
     minimal_out = enhanced_miet_ptu_pipeline(
         r"D:\MIET\fromTao\data for share\BOTTOM-22.ptu",
