@@ -674,59 +674,278 @@ def interp1_nan(x: np.ndarray, y: np.ndarray, xq: np.ndarray) -> np.ndarray:
     return np.interp(xq, x, y, left=np.nan, right=np.nan)
 
 
-def tttr2bin(sync_ticks: np.ndarray, macrobin_ticks: float) -> np.ndarray:
-    """Bin photon arrivals by macro time bins (integer ticks)."""
-    s = np.asarray(sync_ticks, dtype=np.int64)
-    if s.size == 0:
+def tttr2bin(
+    y: np.ndarray,
+    binwidth: float = 1.0,
+    flag: Optional[Union[np.ndarray, bool]] = None,
+    *,
+    rebase: bool = True,
+) -> np.ndarray:
+    """
+    Bin TTTR macro-times into an intensity trace (counts per macro bin).
+
+    Python implementation of TTTR binning:
+        tttr2bin(y, binwidth)               -> 1D counts per bin
+        tttr2bin(y, binwidth, logicalflag)  -> 1D counts using subset
+        tttr2bin(y, binwidth, labels)       -> 2D counts per label
+
+    Parameters
+    ----------
+    y : ndarray (N,)
+        Photon macro-arrival times (ticks or any monotonic units).
+    binwidth : float
+        Width of a macro bin in the same units as y (uses floor(y/binwidth)).
+    flag : None, ndarray(bool), or ndarray(int)
+        - None: bin all photons
+        - bool mask: select photons (logical flag branch)
+        - int labels: produce one column per label in min(flag)..max(flag)
+    rebase : bool
+        If True (recommended for streaming/chunked processing):
+            subtract the minimum binned time so bins start at 0 (effectively
+            does this by shifting to min(y) -> 1).
+        If False:
+            bins are computed from absolute y/binwidth (can create huge arrays).
+
+    Returns
+    -------
+    t : ndarray
+        If flag is None or bool mask: shape (nbins,)
+        If flag is int labels: shape (nbins, nlabels)
+
+    Notes
+    -----
+    - This returns counts per bin (not just 0/1).
+    - The original code has a padding trick in the flag branches to avoid edge issues
+       in its diff-based counting. With bincount, padding is unnecessary; we reproduce
+       the same end-result directly.
+    """
+    y = np.asarray(y).ravel()
+    if y.size == 0:
         return np.zeros((0,), dtype=np.int64)
 
-    w = int(np.round(macrobin_ticks))
-    if w <= 0:
-        raise ValueError("macrobin_ticks must be >= 1 tick")
+    if binwidth <= 0:
+        raise ValueError("binwidth must be > 0")
 
-    idx = (s // w).astype(np.int64)
-    counts = np.bincount(idx, minlength=idx.max() + 1)
-    return counts.astype(np.int64)
+    # --- helper: core 1D binning, equivalent semantics ---
+    def _bin_1d(y_sub: np.ndarray) -> np.ndarray:
+        if y_sub.size == 0:
+            return np.zeros((0,), dtype=np.int64)
+
+        # Binning: y = floor(y/binwidth)
+        yb = np.floor(y_sub.astype(np.float64) / float(binwidth)).astype(np.int64)
+
+        # Original: y = y - min(y) + 1  (shift to start at 1)
+        # Python: shift to start at 0 (equivalent)
+        if rebase:
+            yb = yb - yb.min()
+
+        # counts per bin
+        out = np.bincount(yb, minlength=int(yb.max()) + 1).astype(np.int64)
+        return out
+
+    # --- no flag: simple 1D trace ---
+    if flag is None:
+        return _bin_1d(y)
+
+    # --- logical flag branch (mask) ---
+    if isinstance(flag, (bool, np.bool_)) or (
+        isinstance(flag, np.ndarray) and flag.dtype == bool
+    ):
+        mask = np.asarray(flag, dtype=bool).ravel()
+        if mask.size != y.size:
+            raise ValueError("Boolean flag must have the same length as y")
+
+        # Original implementation does a padding trick and then subtracts 1 from first and last bins.
+        # That trick is only needed because their diff-based counting is edge-sensitive.
+        # With bincount, the direct subset binning already matches the intended result.
+        return _bin_1d(y[mask])
+
+    # --- numeric labels branch (multi-channel) ---
+    labels = np.asarray(flag).ravel()
+    if labels.size != y.size:
+        raise ValueError("Numeric flag must have the same length as y")
+
+    # Uses contiguous labels: flagv = min(flag):max(flag)
+    lo = int(np.min(labels))
+    hi = int(np.max(labels))
+    flagv = np.arange(lo, hi + 1, dtype=labels.dtype)
+
+    # To match expected output shape, we need a common nbins across channels.
+    # We'll compute binned times once (so all channels align).
+    yb_all = np.floor(y.astype(np.float64) / float(binwidth)).astype(np.int64)
+    if rebase:
+        yb_all = yb_all - yb_all.min()
+    nbins = int(yb_all.max()) + 1
+
+    t = np.zeros((nbins, flagv.size), dtype=np.int64)
+
+    for j, lab in enumerate(flagv):
+        sel = labels == lab
+        if np.any(sel):
+            t[:, j] = np.bincount(yb_all[sel], minlength=nbins).astype(np.int64)
+
+    return t
 
 
 def tttr2bintcspc(
-    sync_ticks: np.ndarray,
-    params: Tuple[float, int],
-    tcspc_shifted: np.ndarray,
-    n_micro_bins: int,
+    y: np.ndarray,
+    binwidth: Tuple[float, float],
+    tmpx: np.ndarray,
+    Ngate: int,
 ) -> np.ndarray:
-    """Bin TCSPC microtimes inside macro bins (MATLAB tttr2bintcspc analogue)."""
-    s = np.asarray(sync_ticks, dtype=np.int64)
-    t = np.asarray(tcspc_shifted, dtype=np.int64)
-    if s.size == 0:
-        return np.zeros((n_micro_bins, 0), dtype=np.int64)
+    """
+    Bin TTTR data into a 2D macro-time × micro-time histogram (TCSPC trace).
+    
+    This function is a streaming-safe Python implementation of the call
+    
+        mHist2(ceil(y/binwidth(1)), round(tmpx/binwidth(2)), ...)
+    
+    used in MIET / pFCS workflows, with explicit re-binning in macro- and
+    micro-time and per-block time rebasing to control memory usage.
+    
+    Parameters
+    ----------
+    sync_ticks : ndarray (N,)
+        Photon macro-arrival times in sync ticks. These may be absolute
+        TTTR times or chunk-local times.
+    
+    params : tuple (macrobin_width_ticks, microtime_rebin_factor)
+        macrobin_width_ticks :
+            Width of one macro-time bin in sync ticks
+            (typically tbin * SyncRate).
+        microtime_rebin_factor :
+            Integer factor by which TCSPC channels are rebinned
+            (e.g. 8).
+    
+    tcspc_shifted : ndarray (N,)
+        Shifted TCSPC microtime indices for gated photons:
+            (tcspc - ind1) * gate
+        Valid gated photons have positive values; ungated photons are zero.
+    
+    n_micro_bins : int
+        Number of microtime bins in the output histogram after rebinning.
+    
+    Returns
+    -------
+    out : ndarray, shape (n_micro_bins, n_macro_bins)
+        2D histogram of photon counts with
+            rows    → microtime bins
+            columns → macro-time bins
+        The macro-time axis is rebased so that the first photon in this call
+        defines macro bin 0.
+    
+    Notes
+    -----
+    - This function performs **no artificial capping** of macro bins and
+      does not discard valid photons.
+    - Macro-time indices are **rebased per call** to keep the output array
+      size bounded when processing long PTU streams in chunks.
+    - Semantically equivalent to the original implementation when applied
+      block-wise, but not intended to reproduce a single global
+      mHist2 call over the entire experiment duration.
+    """
 
-    macro_w = int(np.round(params[0]))
-    micro_rebin = int(params[1])
-    if macro_w <= 0:
-        raise ValueError("macrobin width must be >=1")
-    if micro_rebin <= 0:
-        raise ValueError("micro rebin must be >=1")
+    bw1, bw2 = float(binwidth[0]), float(binwidth[1])
 
-    valid = t > 0
-    if not np.any(valid):
-        n_macro = int((s.max() // macro_w) + 1)
-        return np.zeros((n_micro_bins, n_macro), dtype=np.int64)
+    y = np.asarray(y, dtype=float).ravel()
+    tmpx = np.asarray(tmpx, dtype=float).ravel()
 
-    s = s[valid]
-    t = t[valid]
+    if y.size == 0:
+        ny = int(np.round(Ngate / bw2))
+        return np.zeros((ny, 0), dtype=np.int64)
 
-    macro_idx = (s // macro_w).astype(np.int64)
-    micro_idx = (t // micro_rebin).astype(np.int64)
+    # Scaling
+    y = y / bw1
+    tmpx = tmpx / bw2
 
-    keep = (micro_idx >= 0) & (micro_idx < n_micro_bins)
-    macro_idx = macro_idx[keep]
-    micro_idx = micro_idx[keep]
+    # Bin indices (1-based)
+    xi = np.ceil(y).astype(np.int64)      # macro bins
+    yi = np.round(tmpx).astype(np.int64)  # micro bins
 
-    n_macro = int(macro_idx.max() + 1) if macro_idx.size else int((s.max() // macro_w) + 1)
-    out = np.zeros((n_micro_bins, n_macro), dtype=np.int64)
-    np.add.at(out, (micro_idx, macro_idx), 1)
+    # Drop non-positive micro bins (matches your gating scheme: ungated photons are 0)
+    keep = yi > 0
+    xi = xi[keep]
+    yi = yi[keep]
+    if xi.size == 0:
+        ny = int(np.round(Ngate / bw2))
+        return np.zeros((ny, 0), dtype=np.int64)
+
+    # --- block-local rebase of macro axis to prevent huge arrays ---
+    # This preserves the within-block structure but makes columns start at 1 each block.
+    xi0 = xi.min()
+    xi = xi - xi0 + 1  # still 1-based
+
+    nx = int(xi.max())
+    ny = int(np.round(Ngate / bw2))
+
+    xv = np.arange(1, nx + 1, dtype=np.int64)
+    yv = np.arange(1, ny + 1, dtype=np.int64)
+
+    H_macro_micro = mHist2_indices(xi, yi, xv, yv)  # shape (nx, ny)
+
+    # Downstream expects micro x macro
+    return H_macro_micro.T  # (ny, nx)
+
+
+def mHist2_indices(x: np.ndarray, y: np.ndarray, xv: np.ndarray, yv: np.ndarray) -> np.ndarray:
+    """
+    Exact 2D histogram for integer bin labels, compatible with:
+        mHist2(x, y, xv, yv)
+    where x, y are already integer bin indices and xv, yv are explicit grids.
+    
+    Drops out-of-range events (does NOT clip).
+    Returns array shaped (len(xv), len(yv)), x as rows, y as cols.
+    """
+    x = np.asarray(x).ravel().astype(np.int64, copy=False)
+    y = np.asarray(y).ravel().astype(np.int64, copy=False)
+    xv = np.asarray(xv).astype(np.int64, copy=False)
+    yv = np.asarray(yv).astype(np.int64, copy=False)
+
+    if x.size == 0:
+        return np.zeros((xv.size, yv.size), dtype=np.int64)
+
+    # Map integer labels -> 0..nx-1 / 0..ny-1 using offset (because xv,yv are consecutive integers here)
+    x0, x1 = int(xv[0]), int(xv[-1])
+    y0, y1 = int(yv[0]), int(yv[-1])
+
+    keep = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
+    x = x[keep] - x0
+    y = y[keep] - y0
+
+    nx = xv.size
+    ny = yv.size
+
+    out = np.zeros((nx, ny), dtype=np.int64)
+    np.add.at(out, (x, y), 1)
     return out
+
+
+def _append_trace_with_merge(trace_parts: list[np.ndarray], block: np.ndarray) -> None:
+    """Append 1D counts block, merging boundary bin with previous if needed."""
+    if block.size == 0:
+        return
+    if not trace_parts:
+        trace_parts.append(block)
+        return
+    # merge first element of new block into last element of previous block
+    trace_parts[-1][-1] += block[0]
+    if block.size > 1:
+        trace_parts.append(block[1:])
+
+
+def _append_tmptau_with_merge(tau_parts: list[np.ndarray], block: np.ndarray) -> None:
+    """
+    Append 2D (micro, macro) block, merging boundary macro-bin with previous block.
+    """
+    if block.size == 0 or block.shape[1] == 0:
+        return
+    if not tau_parts:
+        tau_parts.append(block)
+        return
+    # merge first macro column
+    tau_parts[-1][:, -1] += block[:, 0]
+    if block.shape[1] > 1:
+        tau_parts.append(block[:, 1:])
 
 
 def photobleach_fit_exp(normtrace: np.ndarray) -> np.ndarray:
