@@ -46,7 +46,7 @@ def _load_metals_db(metals_path: Optional[Union[str, Path]] = None) -> MetalsDB:
 
 
 # =============================================================================
-# PicoQuant PTU: Tag types (from MATLAB)
+# PicoQuant PTU: Tag types
 # =============================================================================
 TY_EMPTY8       = 0xFFFF0008
 TY_BOOL8        = 0x00000008
@@ -62,7 +62,7 @@ TY_BINARY_BLOB  = 0xFFFFFFFF
 
 
 # =============================================================================
-# PicoQuant TTTR Record types (from MATLAB)
+# PicoQuant TTTR Record types
 # =============================================================================
 rtPicoHarpT3     = 0x00010303
 rtPicoHarpT2     = 0x00010203
@@ -105,7 +105,7 @@ def _read_f64(f) -> float:
 
 
 def _to_namespace(x: Any) -> Any:
-    """Recursively convert dict->SimpleNamespace for MATLAB-struct-like access."""
+    """Recursively convert dict->SimpleNamespace for struct-like access."""
     if isinstance(x, dict):
         return SimpleNamespace(**{k: _to_namespace(v) for k, v in x.items()})
     if isinstance(x, list):
@@ -115,9 +115,9 @@ def _to_namespace(x: Any) -> Any:
 
 def _set_head_value(store: Dict[str, Any], key: str, idx: int, value: Any) -> None:
     """
-    Mimic MATLAB PTU_Read_Head behavior:
+    Mimic PTU_Read_Head behavior:
       - TagIdx == -1: store scalar at head.TagIdent
-      - TagIdx > -1 : store indexed at head.TagIdent(idx+1) (MATLAB 1-based)
+      - TagIdx > -1 : store indexed at head.TagIdent(idx+1) (1-based)
     In Python we store indexed tags as lists with 0-based indices.
     """
     if idx < 0:
@@ -135,16 +135,16 @@ def _set_head_value(store: Dict[str, Any], key: str, idx: int, value: Any) -> No
 
 
 # =============================================================================
-# PTU header reader (MATLAB PTU_Read_Head port)
+# PTU header reader (PTU_Read_Head port)
 # =============================================================================
 def PTU_Read_Head(path: Union[str, "os.PathLike[str]"]) -> SimpleNamespace:
     """
-    Read PicoQuant Unified TTTR (.ptu) header and return a MATLAB-like struct.
+    Read PicoQuant Unified TTTR (.ptu) header and return a struct-like object.
 
     Notes
     -----
     - This version ignores Leica/Falcon oddities as requested (no tag-ident cleanup).
-    - head.length is the byte offset where TTTR records begin, matching MATLAB logic:
+    - head.length is the byte offset where TTTR records begin, following the logic:
       head.length = ftell(fid) + 8 after reading the Header_End tag header.
     """
     head_store: Dict[str, Any] = {}
@@ -194,7 +194,7 @@ def PTU_Read_Head(path: Union[str, "os.PathLike[str]"]) -> SimpleNamespace:
             elif tag_typ == TY_WIDESTRING:
                 nbytes = _read_i64(f)
                 raw = _read_bytes(f, int(nbytes))
-                # Remove zero bytes as MATLAB does
+                # Remove zero bytes as needed
                 value = bytes([b for b in raw if b != 0]).decode("latin1", errors="ignore")
 
             elif tag_typ == TY_BINARY_BLOB:
@@ -213,7 +213,7 @@ def PTU_Read_Head(path: Union[str, "os.PathLike[str]"]) -> SimpleNamespace:
             tag_idx = _read_i32(f)
             tag_typ = _read_u32(f)
 
-        # MATLAB: head.length = ftell(fid) + 8
+        # Original: head.length = ftell(fid) + 8
         # We have read Header_End tag header but not its 8-byte payload.
         head_store["length"] = int(f.tell() + 8)
 
@@ -221,7 +221,7 @@ def PTU_Read_Head(path: Union[str, "os.PathLike[str]"]) -> SimpleNamespace:
 
 
 # =============================================================================
-# TTTR record reader (MATLAB PTU_Read port)
+# TTTR record reader (PTU_Read port)
 # =============================================================================
 def PTU_Read(
     path: Union[str, "os.PathLike[str]"],
@@ -235,7 +235,7 @@ def PTU_Read(
     ----------
     cnts:
       - int N         : read N records from the start of TTTR stream
-      - (start, N)    : seek to record #start (1-based like MATLAB) then read N
+      - (start, N)    : seek to record #start (1-based) then read N
 
     Returns
     -------
@@ -244,7 +244,7 @@ def PTU_Read(
     Notes
     -----
     - num is the number of 32-bit records read from disk (including overflow records).
-    - overflow records are removed from the returned arrays, like MATLAB.
+    - overflow records are removed from the returned arrays.
     """
     if head is None:
         head = PTU_Read_Head(path)
@@ -371,11 +371,11 @@ def PTU_Read(
 
 
 # =============================================================================
-# MATLAB mHist equivalent
+# mHist equivalent
 # =============================================================================
 def mhist(values: np.ndarray, bins: np.ndarray) -> np.ndarray:
     """
-    MATLAB mHist(values, bin) for integer consecutive bins.
+    mHist(values, bin) for integer consecutive bins.
     Returns counts aligned to bins.
     """
     values = np.asarray(values)
@@ -410,7 +410,7 @@ def _channel_list_from_data(chan: np.ndarray, special: np.ndarray, min_occurrenc
 
 
 # =============================================================================
-# Harp_tcspc (MATLAB Harp_tcspc port, PTU only)
+# Harp_tcspc (Harp_tcspc port, PTU only)
 # =============================================================================
 @dataclass
 class HarpTCSPCResult:
@@ -432,7 +432,7 @@ def harp_tcspc(
     emulate_matlab_deadtime_histogram: bool = False,
 ) -> HarpTCSPCResult:
     """
-    Python port of MATLAB Harp_tcspc for .ptu files.
+    Python port of Harp_tcspc for .ptu files.
 
     Parameters
     ----------
@@ -443,7 +443,7 @@ def harp_tcspc(
     cache : save/load sidecar npz cache "<name>.ht3tcspc.npz"
     emulate_matlab_deadtime_histogram :
         Default False: remove photons violating deadtime (intended meaning).
-        True: emulate MATLAB deadtime branch that appears to histogram violating photons.
+        True: emulate original deadtime branch that appears to histogram violating photons.
     """
     name = Path(name)
     if name.suffix.lower() != ".ptu":
@@ -659,10 +659,10 @@ def tttr2xfcs(y: np.ndarray, num: np.ndarray, Ncasc: int, Nsub: int) -> Tuple[np
 
 
 # =============================================================================
-# MATLAB helper translations and MIET+PTU pipeline
+# Helper translations and MIET+PTU pipeline
 # =============================================================================
 def interp1_nan(x: np.ndarray, y: np.ndarray, xq: np.ndarray) -> np.ndarray:
-    """MATLAB interp1(...,'linear',NaN) equivalent."""
+    """interp1(...,'linear',NaN) equivalent."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     xq = np.asarray(xq, dtype=float)
@@ -985,7 +985,7 @@ def photobleach_fit_exp(normtrace: np.ndarray) -> np.ndarray:
 
 
 def mseb_like(x: np.ndarray, y_mean: np.ndarray, y_std: np.ndarray, label: str):
-    """Minimal shaded-error plot replacement for MATLAB mseb."""
+    """Minimal shaded-error plot replacement for mseb."""
     x = np.asarray(x, dtype=float)
     y_mean = np.asarray(y_mean, dtype=float)
     y_std = np.asarray(y_std, dtype=float)
@@ -1029,7 +1029,7 @@ def run_miet_ptu_pipeline(
     nbunches: int = 10,
     metals_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
-    """Full MIET + PTU workflow translated from MATLAB."""
+    """Full MIET + PTU workflow implementation."""
 
     ptu_path = Path(ptu_path)
     metals = _load_metals_db(metals_path)
