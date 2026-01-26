@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -310,13 +311,25 @@ def PTU_Read(
         ind_overflow = (chan == 15) & ((tcspc & 0xF) == 0)
 
     elif mode == "HHT3_like":
-        special_bit = (raw & 0x80000000) != 0
-        chan = ((raw >> 25) & 0x3F).astype(np.int64)
-        tcspc = ((raw >> 10) & 0x7FFF).astype(np.int64)
-        sync = (raw & 0x3FF).astype(np.int64)
-
-        ind_overflow = special_bit & (chan == 63)
-        special = (special_bit.astype(np.int64) * chan).astype(np.int64)
+        # Keep everything in small dtypes to avoid big temporary allocations
+        special_bit = (raw & np.uint32(0x80000000)) != 0  # bool
+        chan_u8 = ((raw >> 25) & np.uint32(0x3F)).astype(np.uint8)      # 0..63
+        tcspc_u16 = ((raw >> 10) & np.uint32(0x7FFF)).astype(np.uint16) # 0..32767
+        sync_u16 = (raw & np.uint32(0x3FF)).astype(np.uint16)           # 0..1023
+        
+        # overflow markers: special bit set and chan==63
+        ind_overflow = special_bit & (chan_u8 == np.uint8(63))
+        
+        # "special" code: 0 for photons, else marker code (chan value)
+        # Avoid bool->int64 conversion; store as uint8
+        special_u8 = np.zeros(raw.shape[0], dtype=np.uint8)
+        special_u8[special_bit] = chan_u8[special_bit]
+        
+        # Promote only what you must later (sync needs wraparound accumulation => int64)
+        chan = chan_u8.astype(np.int64, copy=False)
+        tcspc = tcspc_u16.astype(np.int64, copy=False)
+        sync = sync_u16.astype(np.int64, copy=False)
+        special = special_u8.astype(np.int64, copy=False)
 
     elif mode in ("HydraHarpT2", "HHT2_like"):
         sync = (raw & 0x01FFFFFF).astype(np.int64)
