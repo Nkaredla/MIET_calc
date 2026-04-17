@@ -1,5 +1,9 @@
 # MIET and Confocal Microscopy Simulation Package
 
+## License
+
+This project is released under the CC0 1.0 Universal license.
+
 ## Overview
 
 This Python package provides a collection of tools for simulating phenomena related to fluorescence microscopy, specifically focusing on Metal-Induced Energy Transfer (MIET) and the optics of confocal microscopy. It is a Python port of MATLAB-based calculations, designed for researchers and students in optics and biophysics. A majority of the functions were written in Matlab originally by Joerg Enderlein and group, University of Goettingen (https://www.joerg-enderlein.de/).
